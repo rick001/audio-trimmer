@@ -87,11 +87,28 @@ async function removeSilence(inputPath, outputPath) {
   return new Promise((resolve, reject) => {
     // Use ffmpeg's silenceremove filter to automatically remove silence
     // This is more efficient than manually cutting segments
-    ffmpeg(inputPath)
+    const outputExt = path.extname(outputPath).toLowerCase();
+    const command = ffmpeg(inputPath)
       .audioFilters([
         'silenceremove=stop_periods=-1:stop_duration=0.5:stop_threshold=-30dB'
-      ])
-      .audioCodec('copy')
+      ]);
+
+    // Set appropriate audio codec based on output format
+    // Audio filters require re-encoding, so we can't use codec copy
+    if (outputExt === '.mp3' || outputExt === '.mpeg') {
+      command.audioCodec('libmp3lame').audioBitrate(192);
+    } else if (outputExt === '.m4a' || outputExt === '.mp4') {
+      command.audioCodec('aac').audioBitrate(192);
+    } else if (outputExt === '.ogg') {
+      command.audioCodec('libvorbis');
+    } else if (outputExt === '.wav') {
+      command.audioCodec('pcm_s16le');
+    } else {
+      // Default to aac for other formats
+      command.audioCodec('aac').audioBitrate(192);
+    }
+
+    command
       .on('start', (commandLine) => {
         console.log('FFmpeg command: ' + commandLine);
       })
