@@ -48,6 +48,51 @@ const upload = multer({
   }
 });
 
+// Function to get audio metadata
+function getAudioMetadata(audioPath) {
+  return new Promise((resolve, reject) => {
+    ffmpeg.ffprobe(audioPath, (err, metadata) => {
+      if (err) {
+        reject(err);
+        return;
+      }
+      
+      const audioStream = metadata.streams.find(stream => stream.codec_type === 'audio');
+      if (!audioStream) {
+        reject(new Error('No audio stream found'));
+        return;
+      }
+
+      // Try to get bitrate from stream first, then format, then calculate from file size
+      let bitrate = audioStream.bit_rate ? parseInt(audioStream.bit_rate) : null;
+      if (!bitrate && metadata.format && metadata.format.bit_rate) {
+        bitrate = parseInt(metadata.format.bit_rate);
+      }
+      
+      // If still no bitrate, try to calculate from file size and duration
+      if (!bitrate && metadata.format && metadata.format.size && metadata.format.duration) {
+        const fileSizeBytes = parseInt(metadata.format.size);
+        const durationSeconds = parseFloat(metadata.format.duration);
+        if (durationSeconds > 0) {
+          // Calculate bitrate: (file_size * 8) / duration
+          bitrate = Math.floor((fileSizeBytes * 8) / durationSeconds);
+        }
+      }
+      
+      const codec = audioStream.codec_name;
+      const sampleRate = audioStream.sample_rate;
+      const channels = audioStream.channels;
+
+      resolve({
+        bitrate: bitrate,
+        codec: codec,
+        sampleRate: sampleRate,
+        channels: channels
+      });
+    });
+  });
+}
+
 // Function to detect silence and get silence periods
 function detectSilence(audioPath) {
   return new Promise((resolve, reject) => {
@@ -83,7 +128,7 @@ function detectSilence(audioPath) {
 }
 
 // Function to remove silence from audio
-async function removeSilence(inputPath, outputPath) {
+async function removeSilence(inputPath, outputPath, metadata = null) {
   return new Promise((resolve, reject) => {
     // Use ffmpeg's silenceremove filter to automatically remove silence
     // This is more efficient than manually cutting segments
@@ -93,24 +138,68 @@ async function removeSilence(inputPath, outputPath) {
         'silenceremove=stop_periods=-1:stop_duration=0.5:stop_threshold=-30dB'
       ]);
 
+    // Get original bitrate or use smart defaults
+    let targetBitrate = null;
+    if (metadata && metadata.bitrate) {
+      // Convert to kbps and use exact original bitrate to maintain file size and quality
+      const originalKbps = Math.floor(metadata.bitrate / 1000);
+      targetBitrate = Math.max(32, originalKbps); // Use exact original, min 32kbps for very low quality
+    }
+
     // Set appropriate audio codec based on output format
     // Audio filters require re-encoding, so we can't use codec copy
+    // Match original bitrate to maintain similar file size
     if (outputExt === '.mp3' || outputExt === '.mpeg') {
-      command.audioCodec('libmp3lame').audioBitrate(192);
+      command.audioCodec('libmp3lame');
+      
+      if (targetBitrate) {
+        // Use the exact original bitrate to match original file size and quality
+        console.log(`Using original bitrate: ${targetBitrate}kbps`);
+        
+        // Use the bitrate directly - libmp3lame uses VBR by default when bitrate is specified
+        command.audioBitrate(targetBitrate);
+      } else {
+        // Default to 128kbps for good compression if bitrate unknown
+        console.log('Original bitrate not detected, using default 128kbps');
+        command.audioBitrate(128);
+      }
     } else if (outputExt === '.m4a' || outputExt === '.mp4') {
-      command.audioCodec('aac').audioBitrate(192);
+      // AAC with original bitrate
+      if (targetBitrate) {
+        // Use the exact original bitrate
+        command.audioCodec('aac')
+          .audioBitrate(targetBitrate);
+      } else {
+        command.audioCodec('aac')
+          .audioBitrate(96); // Default to 96kbps for good compression
+      }
+      command.addOption('-profile:a', 'aac_low'); // Use AAC-LC profile for compatibility
     } else if (outputExt === '.ogg') {
       command.audioCodec('libvorbis');
+      if (targetBitrate) {
+        command.audioBitrate(Math.min(targetBitrate, 256));
+      }
     } else if (outputExt === '.wav') {
+      // WAV is uncompressed, but we can use it if needed
       command.audioCodec('pcm_s16le');
     } else {
-      // Default to aac for other formats
-      command.audioCodec('aac').audioBitrate(192);
+      // Default to aac with original bitrate
+      if (targetBitrate) {
+        // Use the exact original bitrate
+        command.audioCodec('aac')
+          .audioBitrate(targetBitrate);
+      } else {
+        command.audioCodec('aac')
+          .audioBitrate(96); // Default to 96kbps for good compression
+      }
     }
 
     command
       .on('start', (commandLine) => {
         console.log('FFmpeg command: ' + commandLine);
+        if (metadata) {
+          console.log(`Original bitrate: ${metadata.bitrate ? (metadata.bitrate / 1000).toFixed(0) + 'kbps' : 'unknown'}`);
+        }
       })
       .on('progress', (progress) => {
         console.log('Processing: ' + Math.round(progress.percent) + '% done');
@@ -140,8 +229,17 @@ app.post('/api/trim-silence', upload.single('audio'), async (req, res) => {
   try {
     console.log(`Processing audio file: ${req.file.originalname}`);
     
-    // Remove silence from audio
-    await removeSilence(inputPath, outputPath);
+    // Get original audio metadata to preserve quality settings
+    let metadata = null;
+    try {
+      metadata = await getAudioMetadata(inputPath);
+      console.log('Original audio metadata:', metadata);
+    } catch (err) {
+      console.warn('Could not read audio metadata, using defaults:', err.message);
+    }
+    
+    // Remove silence from audio with compression optimization
+    await removeSilence(inputPath, outputPath, metadata);
 
     // Check if output file was created
     if (!fs.existsSync(outputPath)) {
